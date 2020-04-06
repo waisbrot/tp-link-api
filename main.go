@@ -1,17 +1,21 @@
 package main
 
 import (
-	"fmt"
+	log "github.com/sirupsen/logrus"
 	"github.com/waisbrot/tp-link-api/lib"
 )
 
 func main() {
+	log.SetLevel(log.TraceLevel)
 	conf := lib.Config{
-		Host: "http://192.168.0.1",
+		Host:     "http://192.168.0.1",
+		Username: "admin",
+		Password: "admin",
 	}
-	var client, err = lib.Client(&conf)
+	client, err := lib.NewClient(&conf)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(client)
+	log.Info("Fetching address reservations")
+	client.DHCPAddressReservations()
 }
