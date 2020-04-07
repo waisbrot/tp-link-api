@@ -14,11 +14,10 @@ type DHCPAddressReservation struct {
 }
 
 func (client *Client) DHCPAddressReservations() (reservations []DHCPAddressReservation, err error) {
-	client.setUrl("/userRpm/FixMapCfgRpm.htm")
-	body, err := client.doHttp()
+	body, err := client.FetchPath("/userRpm/FixMapCfgRpm.htm")
 	log.Debugf("%s", body)
 	re := regexp.MustCompile(`"((?:[0-9A-F]{2}-){5}[0-9A-F]{2})", "([0-9.]+)", ([01]),`)
-	matches := re.FindAllSubmatch(body, -1)
+	matches := re.FindAllStringSubmatch(body, -1)
 	log.Infof("Found %d address reservations", len(matches))
 	for _, match := range matches {
 		id, err := strconv.ParseUint(string(match[1][0]), 10, 64)

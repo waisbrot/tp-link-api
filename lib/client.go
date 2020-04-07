@@ -1,25 +1,21 @@
 package lib
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
-	"io/ioutil"
-	"net"
-	"net/http"
 	"net/url"
+	"os/exec"
 	"path"
 	"regexp"
 	"strings"
-	"time"
 )
 
 type Client struct {
-	http   *http.Client
-	req    *http.Request
 	conf   *Config
 	host   string
 	magic  string
@@ -49,82 +45,68 @@ func (client *Client) generateCookie() (err error) {
 	return
 }
 
-func (client *Client) blindFetch(path string) (err error) {
-	client.setUrl(path)
-	body, err := client.doHttp()
-	if err != nil {
-		return
+func (client *Client) buildUrl(urlPath string) (url string) {
+	return path.Join(client.host, client.magic, urlPath)
+}
+
+// Simple wrapper around Curl with the few args we care about
+func (client *Client) Curl(pieces map[string]string) (reply string) {
+	args := []string{"--silent"}
+	if referrer, ok := pieces["referrer"]; ok {
+		args = append(args, "-H")
+		args = append(args, "Referrer: "+referrer)
 	}
-	if len(body) < 300 {
-		log.Errorf("Body looks too short: %s", body)
+	if cookie, ok := pieces["cookie"]; ok {
+		args = append(args, "-H")
+		args = append(args, "Cookie: "+cookie)
 	}
+	if url, ok := pieces["url"]; ok {
+		args = append(args, url)
+	}
+	cmd := exec.Command("curl", args...)
+	log.Debugf("%+v", cmd)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		log.Errorf("Error while trying to run Curl")
+		panic(err)
+	}
+	return out.String()
+}
+
+// Interpret the arg as a relative path and insert magic + auth
+func (client *Client) FetchPath(path string) (reply string, err error) {
+	url := client.buildUrl(path)
+	reply, err = client.fetchUrl(url)
 	return
 }
 
-func (client *Client) blindFetches(paths ...string) (err error) {
-	for _, path := range paths {
-		if err := client.blindFetch(path); err != nil {
-			return err
-		}
-	}
-	return nil
+// Interpret the arg as a complete URL and just insert auth headers
+func (client *Client) fetchUrl(url string) (reply string, err error) {
+	reply = client.Curl(map[string]string{
+		"url":      url,
+		"referrer": client.host,
+		"cookie":   client.cookie,
+	})
+	return
 }
 
-func (client *Client) parseRedirect(body []byte) (newUrl string, err error) {
+func (client *Client) parseRedirect(body string) (newUrl string, err error) {
 	re := regexp.MustCompile(`window.parent.location.href\s*=\s*"([^"]+)"`)
-	matches := re.FindSubmatch(body)
+	matches := re.FindStringSubmatch(body)
 	newUrl = string(matches[1])
 	log.Info("newUrl=", newUrl)
-	return
-}
-
-func (client *Client) setUrl(newUrl string) (err error) {
-	client.req.URL, err = url.Parse("http://" + client.host + client.magic + newUrl)
-	return
-}
-
-func (client *Client) doHttp() (body []byte, err error) {
-	log.WithFields(log.Fields{"url": client.req.URL, "headers": client.req.Header}).Debug("HTTP request")
-	res, err := client.http.Do(client.req)
-	if err != nil {
-		return
-	}
-	body, err = ioutil.ReadAll(res.Body)
-	res.Body.Close()
 	return
 }
 
 func NewClient(conf *Config) (client *Client, err error) {
 	client = &Client{
 		conf: conf,
-	}
-	client.http = &http.Client{
-		Timeout: time.Second * 5,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-			ForceAttemptHTTP2:     false,
-			DisableCompression:    true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
+		host: conf.Host,
 	}
 
 	// Try connecting, to see if the URL is maybe OK
-	res, err := client.http.Get(conf.Host)
-	if err != nil {
-		return
-	}
-	if res.StatusCode != 200 {
-		err = errors.New("Non-200 response")
-		return
-	}
+	res := client.Curl(map[string]string{"url": client.host})
 	log.Info("Get was OK")
 
 	// Now log in
@@ -132,53 +114,37 @@ func NewClient(conf *Config) (client *Client, err error) {
 	if err != nil {
 		return
 	}
-	loginUrl := fmt.Sprintf("%s/userRpm/LoginRpm.htm?Save=Save", conf.Host)
-	client.req, err = http.NewRequest("GET", loginUrl, nil)
+	loginUrl := fmt.Sprintf("%s/userRpm/LoginRpm.htm?Save=Save", client.host)
+	res, err = client.fetchUrl(loginUrl)
 	if err != nil {
 		return
 	}
-	client.req.Header.Set("User-Agent", "curl/7.58.0")
-	client.req.Header.Set("Accept", "*/*")
-	client.req.Header.Set("Referrer", conf.Host+"/")
-	client.req.Header.Set("Cookie", client.cookie)
-	client.req.Header.Del("Accept-Encoding")
-	body, err := client.doHttp()
-	if err != nil {
-		return
-	}
-	newUrl, err := client.parseRedirect(body)
+	newUrl, err := client.parseRedirect(res)
 	if err != nil {
 		return
 	}
 	log.Info("Apparently logged in OK")
+
+	// Parse out the magic string that goes in front of all paths now
 	redirUrl, err := url.Parse(newUrl)
 	if err != nil {
 		return
 	}
-	client.host = redirUrl.Host
+	client.host = "http://" + redirUrl.Host
 	for magicHunt := redirUrl.Path; magicHunt != "/"; magicHunt = path.Dir(magicHunt) {
 		client.magic = magicHunt
 	}
 	log.Debug("magic=", client.magic)
 	log.Debug("Follow redirect to ", redirUrl)
-	client.req.URL = redirUrl
-	body, err = client.doHttp()
+	res, err = client.fetchUrl(redirUrl.String())
 	if err != nil {
 		return
 	}
-	if len(body) < 300 {
+	if len(res) < 300 {
 		err = errors.New("Body looks too short to be the correct page")
 	}
 	log.Info("Loaded main page")
 
-	err = client.blindFetches(
-		"/localiztion/char_set.js",
-		"/frames/top.htm",
-		"/userRpm/MenuRpm.htm",
-	)
-	if err != nil {
-		return
-	}
 	return
 }
 
