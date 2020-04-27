@@ -1,102 +1,75 @@
 package lib
 
 import (
-	"bytes"
-	"crypto/md5"
-	"encoding/base64"
-	"encoding/hex"
-	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"net/url"
-	"os/exec"
+	"github.com/tebeka/selenium"
+	"github.com/tebeka/selenium/chrome"
+	selog "github.com/tebeka/selenium/log"
+	"os"
 	"path"
-	"regexp"
-	"strings"
+	"path/filepath"
+	"time"
 )
 
 type Client struct {
-	conf   *Config
-	host   string
-	magic  string
-	cookie string
+	conf    *Config
+	host    string
+	magic   string
+	cookie  string
+	driver  selenium.WebDriver
+	service *selenium.Service
 }
 
-func (client *Client) generateCookie() (err error) {
-	log.Infof("pass=%s", client.conf.Password)
-	passMd5 := md5.Sum([]byte(client.conf.Password))
-	log.Infof("passMd5=%s", string(passMd5[:]))
-	passHex := hex.EncodeToString(passMd5[:])
-	log.Infof("passhex=%s", passHex)
-	userPass := fmt.Sprintf("%s:%s", client.conf.Username, passHex)
-	log.Infof("userPass=%s", userPass)
-	userPassB64 := base64.StdEncoding.EncodeToString([]byte(userPass))
-	log.Infof("userPassB64=%s", userPassB64)
-	authString := "Basic " + userPassB64
-	// Neither Query nor Path escape but something stupid in between
-	replacer := strings.NewReplacer(
-		" ", "%20",
-		"+", "%2B",
-		"/", "%2F",
-		"=", "%3D",
-	)
-	authStringEscaped := replacer.Replace(authString)
-	client.cookie = "Authorization=" + authStringEscaped
-	return
+func (client *Client) Exit() {
+	defer client.service.Stop()
+	defer client.driver.Quit()
 }
 
-func (client *Client) buildUrl(urlPath string) (url string) {
-	return path.Join(client.host, client.magic, urlPath)
-}
-
-// Simple wrapper around Curl with the few args we care about
-func (client *Client) Curl(pieces map[string]string) (reply string) {
-	args := []string{"--silent"}
-	if referrer, ok := pieces["referrer"]; ok {
-		args = append(args, "-H")
-		args = append(args, "Referrer: "+referrer)
-	}
-	if cookie, ok := pieces["cookie"]; ok {
-		args = append(args, "-H")
-		args = append(args, "Cookie: "+cookie)
-	}
-	if url, ok := pieces["url"]; ok {
-		args = append(args, url)
-	}
-	cmd := exec.Command("curl", args...)
-	log.Debugf("%+v", cmd)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		log.Errorf("Error while trying to run Curl")
+func (client *Client) ClickElement(selector string) {
+	elem := client.FindElementBySelector(selector)
+	moveToElement(elem, 0, 0)
+	err := client.driver.Click(selenium.LeftButton)
+	if err != nil {
 		panic(err)
 	}
-	return out.String()
 }
 
-// Interpret the arg as a relative path and insert magic + auth
-func (client *Client) FetchPath(path string) (reply string, err error) {
-	url := client.buildUrl(path)
-	reply, err = client.fetchUrl(url)
+func (client *Client) FindElementBySelector(selector string) (elem selenium.WebElement) {
+	elem, err := client.driver.FindElement(selenium.ByCSSSelector, selector)
+	if err != nil {
+		panic(err)
+	}
 	return
 }
 
-// Interpret the arg as a complete URL and just insert auth headers
-func (client *Client) fetchUrl(url string) (reply string, err error) {
-	reply = client.Curl(map[string]string{
-		"url":      url,
-		"referrer": client.host,
-		"cookie":   client.cookie,
-	})
+func (client *Client) FindElementsBySelector(selector string) (elems []selenium.WebElement) {
+	elems, err := client.driver.FindElements(selenium.ByCSSSelector, selector)
+	if err != nil {
+		panic(err)
+	}
 	return
 }
 
-func (client *Client) parseRedirect(body string) (newUrl string, err error) {
-	re := regexp.MustCompile(`window.parent.location.href\s*=\s*"([^"]+)"`)
-	matches := re.FindStringSubmatch(body)
-	newUrl = string(matches[1])
-	log.Info("newUrl=", newUrl)
+func getTextFromElement(element selenium.WebElement) (text string) {
+	text, err := element.Text()
+	if err != nil {
+		panic(err)
+	}
 	return
+}
+
+func sendKeysToElement(element selenium.WebElement, keys string) {
+	err := element.SendKeys(keys)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func moveToElement(element selenium.WebElement, x, y int) {
+	err := element.MoveTo(x, y)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func NewClient(conf *Config) (client *Client, err error) {
@@ -104,58 +77,73 @@ func NewClient(conf *Config) (client *Client, err error) {
 		conf: conf,
 		host: conf.Host,
 	}
+	exe, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	exeBasePath, err := filepath.Abs(filepath.Dir(exe))
+	if err != nil {
+		panic(err)
+	}
+	seleniumBasePath := path.Join(exeBasePath, "linux-amd64")
+	seleniumPath := path.Join(seleniumBasePath, "selenium-server-standalone-3.141.59.jar")
+	chromeDriverPath := path.Join(seleniumBasePath, "chromedriver")
+	port := 8080
+	opts := []selenium.ServiceOption{
+		selenium.StartFrameBuffer(),             // Start an X frame buffer for the browser to run in.
+		selenium.ChromeDriver(chromeDriverPath), // Specify the path to ChromeDriver in order to use Chrome.
+		selenium.Output(os.Stderr),              // Output debug information to STDERR.
+	}
+	selenium.SetDebug(false)
+	log.Debugf("seleniumPath=%s chromeDriverPath=%s", seleniumPath, chromeDriverPath)
+	client.service, err = selenium.NewSeleniumService(seleniumPath, port, opts...)
+	if err != nil {
+		panic(err)
+	}
 
-	// Try connecting, to see if the URL is maybe OK
-	res := client.Curl(map[string]string{"url": client.host})
-	log.Info("Get was OK")
+	// Connect to the WebDriver instance running locally.
+	caps := selenium.Capabilities{
+		"browserName": "chrome",
+	}
+	caps.AddChrome(chrome.Capabilities{
+		Args: []string{
+			"no-sandbox",
+			// "verbose",
+			"headless",
+			"disable-dev-shm-usage"},
+	})
+	seleniumLoglevel := selog.Info
+	caps.AddLogging(selog.Capabilities{
+		selog.Server:      seleniumLoglevel,
+		selog.Browser:     seleniumLoglevel,
+		selog.Client:      seleniumLoglevel,
+		selog.Driver:      seleniumLoglevel,
+		selog.Performance: seleniumLoglevel,
+		selog.Profiler:    seleniumLoglevel,
+	})
+	client.driver, err = selenium.NewRemote(caps, fmt.Sprintf("http://localhost:%d/wd/hub", port))
+	if err != nil {
+		panic(err)
+	}
 
-	// Now log in
-	err = client.generateCookie()
-	if err != nil {
-		return
+	// Go to a test page
+	if err := client.driver.Get(conf.Host); err != nil {
+		panic(err)
 	}
-	loginUrl := fmt.Sprintf("%s/userRpm/LoginRpm.htm?Save=Save", client.host)
-	res, err = client.fetchUrl(loginUrl)
+	title, err := client.driver.Title()
 	if err != nil {
-		return
+		panic(err)
 	}
-	newUrl, err := client.parseRedirect(res)
-	if err != nil {
-		return
-	}
-	log.Info("Apparently logged in OK")
+	log.Info("Title=" + title)
 
-	// Parse out the magic string that goes in front of all paths now
-	redirUrl, err := url.Parse(newUrl)
-	if err != nil {
-		return
-	}
-	client.host = "http://" + redirUrl.Host
-	for magicHunt := redirUrl.Path; magicHunt != "/"; magicHunt = path.Dir(magicHunt) {
-		client.magic = magicHunt
-	}
-	log.Debug("magic=", client.magic)
-	log.Debug("Follow redirect to ", redirUrl)
-	res, err = client.fetchUrl(redirUrl.String())
-	if err != nil {
-		return
-	}
-	if len(res) < 300 {
-		err = errors.New("Body looks too short to be the correct page")
-	}
-	log.Info("Loaded main page")
+	usernameField := client.FindElementBySelector("#userName")
+	sendKeysToElement(usernameField, conf.Username)
+	passwordField := client.FindElementBySelector("#pcPassword")
+	sendKeysToElement(passwordField, conf.Password)
+	client.ClickElement("#loginBtn")
+	time.Sleep(500)
+	url, err := client.driver.CurrentURL()
+	log.Info("Got to " + url)
 
 	return
 }
-
-// Hypertext Transfer Protocol
-//     GET /userRpm/LoginRpm.htm?Save=Save HTTP/1.1\r\n
-//     Host: 192.168.0.1\r\n
-//     User-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:74.0) Gecko/20100101 Firefox/74.0\r\n
-//     Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n
-// Accept-Language: en-US,en;q=0.5\r\n
-// Accept-Encoding: gzip, deflate\r\n
-// Connection: keep-alive\r\n
-// Referer: http://192.168.0.1/\r\n
-// Cookie: Authorization=Basic%20YWRtaW46MjEyMzJmMjk3YTU3YTVhNzQzODk0YTBlNGE4MDFmYzM%3D\r\n
-// Upgrade-Insecure-Requests: 1\r\n

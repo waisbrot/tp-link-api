@@ -6,16 +6,21 @@ import (
 )
 
 func main() {
-	log.SetLevel(log.TraceLevel)
+	log.SetLevel(log.InfoLevel)
 	conf := lib.Config{
 		Host:     "http://192.168.0.1",
 		Username: "admin",
 		Password: "admin",
 	}
 	client, err := lib.NewClient(&conf)
+	defer client.Exit()
 	if err != nil {
 		panic(err)
 	}
 	log.Info("Fetching address reservations")
-	client.DHCPAddressReservations()
+	rs, err := client.DHCPAddressReservations()
+	if err != nil {
+		panic(err)
+	}
+	log.Infof("Reservations: %+v", rs)
 }
